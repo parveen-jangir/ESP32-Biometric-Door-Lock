@@ -1,11 +1,10 @@
+## Point need to remember
 
-This directory is intended for PlatformIO Test Runner and project tests.
+1. Initially connect system with internet or now to transfer Wi-Fi credentials <br>
+Sol. SoftAP method
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
-
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+2. No. of API required to complete the system <br>
+(i). Add new user <br>
+(ii). Delete user <br>
+(iii). Mark Attendance <br>
+(iv). 
