@@ -1,0 +1,27 @@
+[
+    {
+        "type": "attendance"
+    },
+    {
+        "type": "attendance",
+        "2025-05-09": [
+            {
+                "member_id": "020PAR0CSE",
+                "checkIn": "09:10:23",
+                "checkOut": "10:45:12"
+            },
+            {
+                "member_id": "020PAR0CSE",
+                "checkIn": "09:12:45",
+                "checkOut": "10:40:50"
+            }
+        ],
+        "2025-05-08": [
+            {
+                "member_id": "020PAR0CSE",
+                "checkIn": "09:05:00",
+                "checkOut": "10:30:00"
+            }
+        ]
+    }
+]

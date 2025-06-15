@@ -4,6 +4,24 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
+#include <Adafruit_Fingerprint.h> // Example library
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <RTCLib.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Create RTC object
+RTC_DS3231 rtc;
+// NTP Client setup
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", TIME_OFFSET, TIME_SYNC_DELAY); // UTC, update every 60 seconds
+
+bool rtcInitialized = true;
+
+HardwareSerial mySerial(2); // UART2 (TX2=17, RX2=16)
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 
 // Create objects
 WebServer server(80);
@@ -30,6 +48,8 @@ String branchID;
 String deviceCode;
 const char *defaultTopic = "unimanage/registerDevice";
 
+int responseCode = 0;
+
 // Function declarations
 void connectToWiFi();
 void startSoftAP();
@@ -38,6 +58,23 @@ void setupNormalMode();
 void scanWiFiNetworks();
 String getSetupPageHTML();
 void setupMQTT();
+void resetDevice(bool type);
+bool addUser(const JsonObject &newMember);
+void logAttendance(String user_id, String timestamp, String status);
+void setupAttendanceDir();
+void cleanupAttendance(int daysToKeep);
+void setupFPSensor();
+uint8_t saveFingerprint(uint16_t id);
+uint16_t getNextAvailableID();
+JsonDocument getSPIFFSStatus();
+bool deleteUser(const String &userId);
+void deviceInfo();
+uint32_t dateStringToSeconds(String dateString);
+uint32_t getCurrentTimestamp();
+bool authenticateUser(JsonObject &obj);
+void checkFingerprint();
+bool authenticateUser(JsonObject &obj);
+int getIndexByBioId(uint16_t bio_id, JsonDocument &doc);
 
 void connectToWiFi()
 {
@@ -388,6 +425,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     }
 }
 
+//reconnectMqtt
+/*
 void reconnectMQTT()
 {
     Serial.println("Connecting with MQTT server..");
@@ -419,6 +458,56 @@ void reconnectMQTT()
     else
     {
         Serial.print("failed, rc=");
+        Serial.print(mqtt.state());
+        doc["status"] = "failed";
+    }
+    sendJsonResponse(doc);
+}
+*/
+
+void reconnectMQTT()
+{
+    Serial.println("Connecting with MQTT server..");
+    JsonDocument doc;
+
+    doc["type"] = "mqtt_status";
+    doc["message"] = mqtt.state();
+
+    if (mqtt.connect("UNI_Manage"))
+    {
+        Serial.println("Connected With MQTT Server");
+
+        if (nvs.getBool("haveRegistered"))
+        {
+            companyID = nvs.getString("companyID", "");
+            branchID = nvs.getString("branchID", "");
+            deviceCode = nvs.getString("deviceCode", "");
+            
+            // Check if we have valid IDs before subscribing
+            if (companyID.length() > 0 && branchID.length() > 0 && deviceCode.length() > 0)
+            {
+                String topicName = "unimanage/" + companyID + "/" + branchID + "/" + deviceCode + "/command";
+                mqtt.subscribe(topicName.c_str());
+                Serial.println("Subscribed to topic: " + topicName);
+            }
+            else
+            {
+                Serial.println("Warning: Empty company/branch/device IDs");
+                mqtt.subscribe(defaultTopic);
+                Serial.println("Subscribed to default topic: " + String(defaultTopic));
+            }
+        }
+        else
+        {
+            mqtt.subscribe(defaultTopic);
+            Serial.println("Subscribed to default topic: " + String(defaultTopic));
+        }
+
+        doc["status"] = "success";
+    }
+    else
+    {
+        Serial.print("MQTT connection failed, rc=");
         Serial.print(mqtt.state());
         doc["status"] = "failed";
     }
@@ -463,6 +552,27 @@ void receiveFromMobile(String data)
             mqtt.subscribe(("unimanage/" + companyID + "/" + branchID + "/" + deviceCode + "/command").c_str());
             mqtt.unsubscribe(defaultTopic);
         }
+        else if (commandType == "enrollUser")
+        {
+            addUser(doc.as<JsonObject>()) ? doc["status"] = 1 : doc["status"] = 0;
+
+            doc["type"] = "enrollUser";
+            doc["message"] = responseCode;
+            sendJsonResponse(doc);
+        }
+        else if (commandType == "spiffsStatus")
+        {
+            sendJsonResponse(getSPIFFSStatus());
+        }
+        else if (commandType == "deleteUser")
+        {
+            deleteUser(doc["userId"]) ? doc["status"] = 1 : doc["status"] = 0;
+            sendJsonResponse(doc);
+        }
+        else if (commandType == "deviceInfo")
+        {
+            deviceInfo();
+        }
         else
         {
             doc.clear();
@@ -474,14 +584,852 @@ void receiveFromMobile(String data)
     }
 }
 
+void deviceInfo()
+{
+    File file = SPIFFS.open("/members.json", "r");
+    if (!file)
+    {
+        Serial.println("Failed to open members file");
+        return;
+    }
+
+    String fileContent = file.readString();
+    file.close();
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, fileContent);
+
+    if (error)
+    {
+        Serial.println("Failed to parse JSON");
+        return;
+    }
+    doc["timeStamp"] = getCurrentTimestamp();
+
+    sendJsonResponse(doc);
+}
+
 void resetDevice(bool type)
 {
     nvs.putBool("haveRegistered", false);
     nvs.putBool("haveWiFiCred", false);
     nvs.clear();
+    SPIFFS.format();
+
+    finger.emptyDatabase();
+
+    JsonDocument initialDoc;
+    JsonArray array = initialDoc.to<JsonArray>();
+
+    File writeFile = SPIFFS.open("/members.json", "w");
+    serializeJson(initialDoc, writeFile);
+    writeFile.close();
+
     ESP.restart();
 }
 
+// Function to load JSON from file into document
+bool loadJsonFromFile(JsonDocument &doc, const char *filename)
+{
+    File file = SPIFFS.open(filename, "r");
+    if (!file)
+    {
+        Serial.println("Failed to open file for reading");
+        return false;
+    }
+
+    String fileContent = file.readString();
+    file.close();
+
+    DeserializationError error = deserializeJson(doc, fileContent);
+    if (error)
+    {
+        Serial.print("JSON parsing failed: ");
+        Serial.println(error.c_str());
+        return false;
+    }
+
+    Serial.println("JSON loaded from file successfully");
+    return true;
+}
+
+// Function to save JSON document to file
+bool saveJsonToFile(JsonDocument &doc, const char *filename)
+{
+    File file = SPIFFS.open(filename, "w");
+    if (!file)
+    {
+        Serial.println("Failed to open file for writing");
+        return false;
+    }
+
+    if (serializeJson(doc, file) == 0)
+    {
+        Serial.println("Failed to write to file");
+        file.close();
+        return false;
+    }
+
+    file.close();
+    Serial.println("JSON saved to file successfully");
+    return true;
+}
+
+// Function to add a new user.
+/*
+bool addUser(const JsonObject &newMember)
+{
+    uint16_t id = getNextAvailableID();
+
+    Serial.println("id: " + id);
+
+    if (id == 0)
+        return 0;
+
+    if (saveFingerprint(id) != true)
+        return 0;
+
+    newMember.remove("type");
+    newMember["punchingId1"] = id;
+    newMember["subsEndInSec"] = dateStringToSeconds(newMember["subscriptionEnd"]);
+
+    JsonDocument members;
+
+    if (!loadJsonFromFile(members, "/members.json"))
+    {
+        return 0;
+    }
+
+    JsonArray membersArray = members.as<JsonArray>();
+
+    JsonObject addedMember = membersArray.createNestedObject();
+
+    for (JsonPair kv : newMember)
+    {
+        addedMember[kv.key()] = kv.value();
+    }
+
+    saveJsonToFile(members, "/members.json");
+
+    nvs.putUShort("lastUsedID", (id));
+
+    return true;
+}
+
+*/
+
+bool addUser(const JsonObject &newMember)
+{
+    uint16_t id = getNextAvailableID();
+
+    Serial.println("Assigned ID: " + String(id));
+
+    if (id == 0)
+    {
+        Serial.println("Failed to get available ID");
+        return false;
+    }
+
+    if (saveFingerprint(id) != true)
+    {
+        Serial.println("Failed to save fingerprint");
+        return false;
+    }
+
+    // Create a copy of the member object to modify
+    JsonDocument tempDoc;
+    JsonObject modifiableMember = tempDoc.to<JsonObject>();
+    
+    // Copy all data except "type"
+    for (JsonPair kv : newMember)
+    {
+        if (strcmp(kv.key().c_str(), "type") != 0)
+        {
+            modifiableMember[kv.key()] = kv.value();
+        }
+    }
+    
+    modifiableMember["punchingId1"] = id;
+    modifiableMember["subsEndInSec"] = dateStringToSeconds(modifiableMember["subscriptionEnd"]);
+
+    JsonDocument members;
+
+    if (!loadJsonFromFile(members, "/members.json"))
+    {
+        Serial.println("Failed to load members file");
+        return false;
+    }
+
+    JsonArray membersArray = members.as<JsonArray>();
+
+    JsonObject addedMember = membersArray.createNestedObject();
+
+    for (JsonPair kv : modifiableMember)
+    {
+        addedMember[kv.key()] = kv.value();
+    }
+
+    if (!saveJsonToFile(members, "/members.json"))
+    {
+        Serial.println("Failed to save members file");
+        return false;
+    }
+
+    nvs.putUShort("lastUsedID", id);
+    Serial.println("User added successfully with ID: " + String(id));
+
+    return true;
+}
+
+// Function to delete user
+bool deleteUser(const String &userId)
+{
+    // Parse JSON
+    JsonDocument doc; // Adjust size based on your needs
+    loadJsonFromFile(doc, "/members.json");
+
+    // Get the array of members
+    JsonArray membersArray = doc.as<JsonArray>();
+    bool userFound = false;
+    int indexToRemove = -1;
+
+    // Find the user by userId
+    for (int i = 0; i < membersArray.size(); i++)
+    {
+        JsonObject member = membersArray[i];
+        if (member["userId"].as<String>() == userId)
+        {
+            userFound = true;
+            indexToRemove = i;
+
+            // Print user details before deletion
+            Serial.println("Found user to delete:");
+            Serial.print("  User ID: ");
+            Serial.println(member["userId"].as<String>());
+            Serial.print("  Name: ");
+            Serial.println(member["name"].as<String>());
+            Serial.print("  User Type: ");
+            Serial.println(member["userType"].as<int>());
+            Serial.print("  Subscription End: ");
+            Serial.println(member["subscriptionEnd"].as<String>());
+            Serial.print("  Punching ID: ");
+            Serial.println(member["punchingId"].as<int>());
+
+            // Delete fingerPrint data from sensor
+            finger.deleteModel(member["punchingId"].as<int>());
+
+            break;
+        }
+    }
+
+    if (!userFound)
+    {
+        Serial.print("User with ID '");
+        Serial.print(userId);
+        Serial.println("' not found");
+        return false;
+    }
+
+    // Remove the user from array
+    membersArray.remove(indexToRemove);
+
+    saveJsonToFile(doc, "/members.json");
+
+    Serial.print("Successfully deleted user: ");
+    Serial.println(userId);
+    return true;
+}
+
+void logAttendance(String user_id, String timestamp, String status)
+{
+    String date = timestamp.substring(0, 10); // Extract YYYY-MM-DD
+    String filePath = "/attendance/" + date + ".json";
+
+    File file = SPIFFS.open(filePath, FILE_READ);
+    DynamicJsonDocument doc(2048);
+    JsonArray records;
+
+    if (file)
+    {
+        DeserializationError error = deserializeJson(doc, file);
+        file.close();
+        if (error)
+        {
+            Serial.println("Failed to parse attendance file: " + String(error.c_str()));
+            doc.clear();
+        }
+        records = doc.as<JsonArray>();
+    }
+    else
+    {
+        records = doc.to<JsonArray>();
+    }
+
+    // Add new attendance record
+    JsonObject record = records.createNestedObject();
+    record["user_id"] = user_id;
+    record["timestamp"] = timestamp;
+    record["status"] = status;
+
+    // Write back to file
+    file = SPIFFS.open(filePath, FILE_WRITE);
+    if (!file)
+    {
+        Serial.println("Failed to open attendance file for writing");
+        return;
+    }
+    serializeJson(doc, file);
+    file.close();
+    Serial.println("Attendance logged for " + user_id);
+
+    // Optionally send to MQTT server
+    JsonDocument mqttDoc;
+    mqttDoc["type"] = "attendance";
+    mqttDoc["user_id"] = user_id;
+    mqttDoc["timestamp"] = timestamp;
+    mqttDoc["status"] = status;
+    sendJsonResponse(mqttDoc);
+}
+
+// Function to create attendance directory if it doesn't exist
+void setupAttendanceDir()
+{
+    if (!SPIFFS.exists("/attendance"))
+    {
+        SPIFFS.mkdir("/attendance");
+        Serial.println("Created /attendance directory");
+    }
+}
+
+JsonDocument getSPIFFSStatus()
+{
+    // Initialize SPIFFS if not already initialized
+    if (!SPIFFS.begin(true))
+    {
+        JsonDocument errorDoc;
+        errorDoc["error"] = "SPIFFS Mount Failed";
+        return errorDoc;
+    }
+
+    // Count files first to properly size the JsonDocument
+    int fileCount = 0;
+    File root = SPIFFS.open("/");
+    if (root && root.isDirectory())
+    {
+        File file = root.openNextFile();
+        while (file)
+        {
+            if (!file.isDirectory())
+            {
+                fileCount++;
+            }
+            file = root.openNextFile();
+        }
+    }
+
+    JsonDocument doc;
+
+    // Get partition information
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    size_t freeBytes = totalBytes - usedBytes;
+
+    // Calculate values in KB with one decimal place
+    float totalKB = totalBytes / 1024.0;
+    float usedKB = usedBytes / 1024.0;
+    float freeKB = freeBytes / 1024.0;
+
+    // Add partition information to document
+    JsonObject partition = doc.createNestedObject("partition");
+    partition["total_kb"] = roundf(totalKB * 10) / 10.0; // Round to 1 decimal place
+    partition["used_kb"] = roundf(usedKB * 10) / 10.0;
+    partition["free_kb"] = roundf(freeKB * 10) / 10.0;
+    partition["used_percent"] = roundf((usedBytes * 1000.0) / totalBytes) / 10.0;
+    partition["free_percent"] = roundf((freeBytes * 1000.0) / totalBytes) / 10.0;
+
+    // Reset and read root directory
+    root = SPIFFS.open("/");
+    if (!root || !root.isDirectory())
+    {
+        doc["error"] = "Failed to open directory";
+        return doc;
+    }
+
+    // Add files information
+    JsonArray files = doc.createNestedArray("files");
+    size_t totalFileSize = 0;
+    fileCount = 0;
+
+    // Iterate through all files
+    File file = root.openNextFile();
+    while (file)
+    {
+        if (!file.isDirectory())
+        {
+            fileCount++;
+            size_t fileSize = file.size();
+            totalFileSize += fileSize;
+
+            // Add file to array
+            JsonObject fileObj = files.createNestedObject();
+            fileObj["name"] = file.name();
+            fileObj["size_kb"] = roundf((fileSize / 1024.0) * 10) / 10.0; // Round to 1 decimal
+            fileObj["size_bytes"] = fileSize;
+        }
+        file = root.openNextFile();
+    }
+
+    // Add summary information
+    doc["file_count"] = fileCount;
+    doc["total_files_kb"] = roundf((totalFileSize / 1024.0) * 10) / 10.0;
+    doc["total_files_bytes"] = totalFileSize;
+
+    return doc;
+}
+
+void cleanupAttendance(int daysToKeep)
+{
+    File root = SPIFFS.open("/attendance");
+    File file = root.openNextFile();
+    String currentDate = "2025-06-08"; // Replace with actual date
+    while (file)
+    {
+        String fileName = file.name();
+        String fileDate = fileName.substring(11, 21); // Extract YYYY-MM-DD
+        // Compare fileDate with currentDate - daysToKeep
+        // Delete if older (implement date comparison logic)
+        file = root.openNextFile();
+    }
+}
+
+void setupFPSensor()
+{
+    // set the data rate for the sensor serial port
+    mySerial.begin(57600, SERIAL_8N1, 16, 17); // RX=16, TX=17 for ESP32 UART2
+    finger.begin(57600);
+    if (finger.verifyPassword())
+    {
+        Serial.println("Fingerprint sensor detected");
+        finger.getParameters();
+        MAX_CAPACITY = finger.capacity;
+    }
+    else
+    {
+        Serial.println("Fingerprint sensor not found");
+        while (true)
+            ; // Halt if sensor fails
+    }
+}
+
+//Check fingerprint
+/*
+void checkFingerprint()
+{
+    int fingerprintID = -1;
+    if (finger.getImage() == FINGERPRINT_OK)
+    {
+        if (finger.image2Tz() == FINGERPRINT_OK)
+        {
+            if (finger.fingerSearch() == FINGERPRINT_OK)
+            {
+                fingerprintID = finger.fingerID;
+                JsonDocument doc;
+                loadJsonFromFile(doc, "/members.json");
+
+                int index = getIndexByBioId(fingerprintID, doc);
+
+                JsonObject user = doc[index];
+
+                serializeJsonPretty(user, Serial);
+
+                if (authenticateUser(user))
+                {
+                    Serial.println("welcome");
+                }
+                else
+                {
+                    Serial.println("get out");
+                }
+            }
+        }
+    }
+}
+*/
+
+void checkFingerprint()
+{
+    int fingerprintID = -1;
+    if (finger.getImage() == FINGERPRINT_OK)
+    {
+        if (finger.image2Tz() == FINGERPRINT_OK)
+        {
+            if (finger.fingerSearch() == FINGERPRINT_OK)
+            {
+                fingerprintID = finger.fingerID;
+                JsonDocument doc;
+                
+                if (!loadJsonFromFile(doc, "/members.json"))
+                {
+                    Serial.println("Failed to load members file");
+                    return;
+                }
+
+                int index = getIndexByBioId(fingerprintID, doc);
+                
+                if (index == -1)
+                {
+                    Serial.println("User not found in database");
+                    return;
+                }
+
+                JsonObject user = doc[index];
+                
+                // Check if user object is valid
+                if (user.isNull())
+                {
+                    Serial.println("Invalid user object");
+                    return;
+                }
+
+                serializeJsonPretty(user, Serial);
+
+                if (authenticateUser(user))
+                {
+                    Serial.println("Access granted - welcome");
+                    // Log attendance
+                    String timestamp = String(getCurrentTimestamp());
+                    Serial.println("current time stamp" + timestamp);
+                    // logAttendance(user["userId"].as<String>(), timestamp, "IN");
+                }
+                else
+                {
+                    Serial.println("Access denied - subscription expired or invalid");
+                }
+            }
+            else
+            {
+                Serial.println("Fingerprint not found in database");
+            }
+        }
+        else
+        {
+            Serial.println("Failed to convert fingerprint image");
+        }
+    }
+}
+
+bool authenticateUser(JsonObject &obj)
+{
+    Serial.println("current time stamp: " + getCurrentTimestamp());
+    Serial.println("user time stamp: " + obj["subsEndInSec"].as<uint32_t>());
+    if (obj["userType"] == 1)
+    {
+        return true;
+    }
+    else if (obj["subsEndInSec"].as<uint32_t>() >= getCurrentTimestamp())
+    {
+        return true;
+    }
+    return false;
+}
+
+uint8_t saveFingerprint(uint16_t id)
+{
+    Serial.print("Waiting for valid finger to enroll as #");
+    Serial.println(id);
+    int p = -1;
+
+    while (p != FINGERPRINT_OK)
+    {
+        p = finger.getImage();
+        switch (p)
+        {
+        case FINGERPRINT_OK:
+            Serial.println("Image taken");
+            break;
+        case FINGERPRINT_NOFINGER:
+            Serial.print(".");
+            break;
+        case FINGERPRINT_PACKETRECIEVEERR:
+            Serial.println("Communication error");
+            break;
+        case FINGERPRINT_IMAGEFAIL:
+            Serial.println("Imaging error");
+            break;
+        default:
+            Serial.println("Unknown error");
+            break;
+        }
+    }
+
+    // OK success!
+
+    p = finger.image2Tz(1);
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+        Serial.println("Image converted");
+        break;
+    case FINGERPRINT_IMAGEMESS:
+        Serial.println("Image too messy");
+        return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+        Serial.println("Communication error");
+        return p;
+    case FINGERPRINT_FEATUREFAIL:
+        Serial.println("Could not find fingerprint features");
+        return p;
+    case FINGERPRINT_INVALIDIMAGE:
+        Serial.println("Could not find fingerprint features");
+        return p;
+    default:
+        Serial.println("Unknown error");
+        return p;
+    }
+
+    Serial.println("Remove finger");
+    delay(2000);
+    p = 0;
+    while (p != FINGERPRINT_NOFINGER)
+    {
+        p = finger.getImage();
+    }
+    Serial.print("ID ");
+    Serial.println(id);
+    p = -1;
+    Serial.println("Place same finger again");
+    while (p != FINGERPRINT_OK)
+    {
+        p = finger.getImage();
+        switch (p)
+        {
+        case FINGERPRINT_OK:
+            Serial.println("Image taken");
+            break;
+        case FINGERPRINT_NOFINGER:
+            Serial.print(".");
+            break;
+        case FINGERPRINT_PACKETRECIEVEERR:
+            Serial.println("Communication error");
+            break;
+        case FINGERPRINT_IMAGEFAIL:
+            Serial.println("Imaging error");
+            break;
+        default:
+            Serial.println("Unknown error");
+            break;
+        }
+    }
+
+    // OK success!
+
+    p = finger.image2Tz(2);
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+        Serial.println("Image converted");
+        break;
+    case FINGERPRINT_IMAGEMESS:
+        Serial.println("Image too messy");
+        return p;
+    case FINGERPRINT_PACKETRECIEVEERR:
+        Serial.println("Communication error");
+        return p;
+    case FINGERPRINT_FEATUREFAIL:
+        Serial.println("Could not find fingerprint features");
+        return p;
+    case FINGERPRINT_INVALIDIMAGE:
+        Serial.println("Could not find fingerprint features");
+        return p;
+    default:
+        Serial.println("Unknown error");
+        return p;
+    }
+
+    // OK converted!
+    Serial.print("Creating model for #");
+    Serial.println(id);
+
+    p = finger.createModel();
+    if (p == FINGERPRINT_OK)
+    {
+        Serial.println("Prints matched!");
+    }
+    else if (p == FINGERPRINT_PACKETRECIEVEERR)
+    {
+        Serial.println("Communication error");
+        return p;
+    }
+    else if (p == FINGERPRINT_ENROLLMISMATCH)
+    {
+        Serial.println("Fingerprints did not match");
+        return p;
+    }
+    else
+    {
+        Serial.println("Unknown error");
+        return p;
+    }
+
+    Serial.print("ID ");
+    Serial.println(id);
+    p = finger.storeModel(id);
+    if (p == FINGERPRINT_OK)
+    {
+        Serial.println("Stored!");
+    }
+    else if (p == FINGERPRINT_PACKETRECIEVEERR)
+    {
+        Serial.println("Communication error");
+        return p;
+    }
+    else if (p == FINGERPRINT_BADLOCATION)
+    {
+        Serial.println("Could not store in that location");
+        return p;
+    }
+    else if (p == FINGERPRINT_FLASHERR)
+    {
+        Serial.println("Error writing to flash");
+        return p;
+    }
+    else
+    {
+        Serial.println("Unknown error");
+        return p;
+    }
+
+    return true;
+}
+
+uint16_t getNextAvailableID()
+{
+    // Get last used ID from Preferences, default to 0 if not set
+    uint16_t lastUsedID = nvs.getUShort("lastUsedID", 0);
+
+    // Get current template count
+    if (finger.getTemplateCount() != FINGERPRINT_OK)
+    {
+        responseCode = F_SEN_COMMU;
+        return 0; // Error: Cannot communicate with sensor
+    }
+
+    // Check if storage is full
+    if (finger.templateCount >= MAX_CAPACITY)
+    {
+        responseCode = F_SEN_FULL;
+        return 0; // Error: Sensor storage is full
+    }
+
+    if (lastUsedID < MAX_CAPACITY - 1)
+    {
+        // Update lastUsedID in Preferences
+        return lastUsedID + 1;
+    }
+
+    // Step 1: Scan for gaps (unused IDs) from 1 to lastUsedID
+    for (uint16_t id = 1; id <= lastUsedID; id++)
+    {
+        if (finger.loadModel(id) == FINGERPRINT_BADLOCATION)
+        {
+            // Found an unused ID
+            return id;
+        }
+    }
+
+    return 0;
+}
+
+// Placeholder for getting user_id from bio_id
+int getIndexByBioId(uint16_t bio_id, JsonDocument &doc)
+{
+    JsonArray userArr = doc.as<JsonArray>();
+
+    for (int i = 0; i < userArr.size(); i++)
+    {
+        JsonObject user = userArr[i];
+        if (user["punchingId1"] == bio_id || user["punchingId2"] == bio_id)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Placeholder for getting current timestamp
+uint32_t getCurrentTimestamp()
+{
+    if (rtcInitialized)
+    {
+        DateTime now = rtc.now();
+        return now.unixtime();
+    }
+    return 0;
+}
+
+uint32_t dateStringToSeconds(String dateString)
+{
+    // Remove 'T' and everything after it (time portion)
+    int tIndex = dateString.indexOf('T');
+    if (tIndex != -1)
+    {
+        dateString = dateString.substring(0, tIndex);
+    }
+
+    // Parse year, month, day
+    int year = dateString.substring(0, 4).toInt();
+    int month = dateString.substring(5, 7).toInt();
+    int day = dateString.substring(8, 10).toInt();
+
+    // Validate parsed values
+    if (year < 1970 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31)
+    {
+        Serial.println("Invalid date format!");
+        return 0;
+    }
+
+    // Create DateTime object with time set to 00:00:00
+    DateTime dt(year, month, day, 0, 0, 0);
+
+    // Return Unix timestamp
+    return dt.unixtime();
+}
+
+void syncRTCWithNTP()
+{
+    if (!wifiConnected || !rtcInitialized)
+    {
+        return;
+    }
+
+    if (timeClient.update())
+    {
+        Serial.print("Syncing RTC with NTP... ");
+
+        unsigned long epochTime = timeClient.getEpochTime();
+
+        // Convert to DateTime object
+        DateTime ntpTime = DateTime(epochTime);
+
+        // Get current RTC time for comparison
+        DateTime rtcTime = rtc.now();
+
+        rtc.adjust(ntpTime);
+    }
+}
+
+
+void printMemoryInfo()
+{
+    Serial.println("=== Memory Info ===");
+    Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+    Serial.println("Heap size: " + String(ESP.getHeapSize()) + " bytes");
+    Serial.println("Free PSRAM: " + String(ESP.getFreePsram()) + " bytes");
+    Serial.println("Min free heap: " + String(ESP.getMinFreeHeap()) + " bytes");
+    Serial.println("==================");
+}
+
+/*
 void setup()
 {
     Serial.begin(115200);
@@ -489,6 +1437,28 @@ void setup()
 
     Serial.println("Smart Bulb Starting...");
 
+    // Initialize SPIFFS
+    if (!SPIFFS.begin(true))
+    { // true = format on failure
+        Serial.println("Failed to mount SPIFFS");
+        return;
+    }
+
+    // Initialize I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+
+    // Initialize RTC
+    if (!rtc.begin())
+    {
+        Serial.println("ERROR: Couldn't find DS3231 RTC!");
+        rtcInitialized = false;
+    }
+
+    Serial.println("SPIFFS mounted successfully");
+    setupAttendanceDir();
+
+    // Initialize fingerprint sensor
+    setupFPSensor();
     // Initialize nvs
     nvs.begin("UniManage", false);
 
@@ -514,6 +1484,8 @@ void loop()
     server.handleClient();
     mqtt.loop();
 
+    checkFingerprint();
+
     // Check WiFi connection status periodically
     if (wifiConnected && WiFi.status() != WL_CONNECTED)
     {
@@ -533,6 +1505,8 @@ void loop()
         reconnectMQTT();
     }
 
+    syncRTCWithNTP();
+
     if (Serial.available())
     {
         String Sdata = Serial.readStringUntil('\n');
@@ -541,6 +1515,155 @@ void loop()
         if (Sdata == "reset")
         {
             resetDevice(1);
+        }
+        else if (Sdata == "spiffs")
+        {
+            getSPIFFSStatus();
+        }
+        else if (Sdata == "enroll")
+        {
+        }
+        else if (Sdata == "check")
+        {
+        }
+    }
+}
+*/
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("Smart Bulb Starting...");
+    printMemoryInfo(); // Check initial memory
+
+    // Initialize SPIFFS
+    if (!SPIFFS.begin(true))
+    { 
+        Serial.println("Failed to mount SPIFFS");
+        return;
+    }
+    Serial.println("SPIFFS mounted successfully");
+
+    // Initialize I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+
+    // Initialize RTC with better error handling
+    if (!rtc.begin())
+    {
+        Serial.println("ERROR: Couldn't find DS3231 RTC!");
+        rtcInitialized = false;
+    }
+    else
+    {
+        Serial.println("RTC initialized successfully");
+        rtcInitialized = true;
+    }
+
+    setupAttendanceDir();
+
+    // Initialize fingerprint sensor
+    setupFPSensor();
+    
+    // Initialize nvs
+    nvs.begin("UniManage", false);
+
+    // Initialize time client
+    timeClient.begin();
+
+    if (nvs.getBool("haveWiFiCred", false))
+    {
+        // Try to load saved WiFi credentials
+        ssid = nvs.getString("ssid", "");
+        password = nvs.getString("password", "");
+        Serial.println("Found saved WiFi credentials");
+        Serial.println("SSID: " + ssid);
+        connectToWiFi();
+    }
+    else
+    {
+        Serial.println("No saved WiFi credentials found");
+        startSoftAP();
+    }
+    
+    printMemoryInfo(); // Check memory after initialization
+}
+
+// 8. Enhanced loop with memory monitoring
+void loop()
+{
+    static unsigned long lastMemoryCheck = 0;
+    static unsigned long lastTimeSync = 0;
+    
+    server.handleClient();
+    
+    if (mqtt.connected())
+    {
+        mqtt.loop();
+    }
+
+    checkFingerprint();
+
+    // Check WiFi connection status periodically
+    if (wifiConnected && WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("WiFi connection lost! Starting SoftAP mode...");
+        wifiConnected = false;
+        startSoftAP();
+    }
+
+    if (haveNewCommand)
+    {
+        haveNewCommand = false;
+        receiveFromMobile(incomingJSON);
+    }
+
+    if (WiFi.status() == WL_CONNECTED && !mqtt.connected())
+    {
+        reconnectMQTT();
+    }
+
+    // Sync time every 60 seconds
+    if (millis() - lastTimeSync > 60000)
+    {
+        syncRTCWithNTP();
+        lastTimeSync = millis();
+    }
+
+    // Check memory every 30 seconds
+    if (millis() - lastMemoryCheck > 30000)
+    {
+        if (ESP.getFreeHeap() < 10000) // Less than 10KB free
+        {
+            Serial.println("WARNING: Low memory!");
+            printMemoryInfo();
+        }
+        lastMemoryCheck = millis();
+    }
+
+    if (Serial.available())
+    {
+        String Sdata = Serial.readStringUntil('\n');
+        Sdata.trim();
+        
+        if (Sdata == "reset")
+        {
+            Serial.println("Device reset command received");
+            resetDevice(true);
+        }
+        else if (Sdata == "spiffs")
+        {
+            JsonDocument spiffsStatus = getSPIFFSStatus();
+            serializeJsonPretty(spiffsStatus, Serial);
+        }
+        else if (Sdata == "memory")
+        {
+            printMemoryInfo();
+        }
+        else if (Sdata == "time")
+        {
+            Serial.println("Current timestamp: " + String(getCurrentTimestamp()));
         }
     }
 }
